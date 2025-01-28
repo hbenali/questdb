@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,50 +25,53 @@
 package io.questdb;
 
 import io.questdb.cairo.CairoEngine;
-import io.questdb.cairo.security.AllowAllCairoSecurityContext;
-import io.questdb.griffin.FunctionFactoryCache;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.SynchronizedJob;
+import io.questdb.std.Misc;
 import io.questdb.tasks.TelemetryTask;
 import io.questdb.tasks.TelemetryWalTask;
-import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
 
 public class TelemetryJob extends SynchronizedJob implements Closeable {
     private static final Log LOG = LogFactory.getLog(TelemetryJob.class);
     private final Telemetry<TelemetryTask> telemetry;
-    private final Telemetry<TelemetryWalTask> telemetryWal;
     private final TelemetryConfigLogger telemetryConfigLogger;
+    private final Telemetry<TelemetryWalTask> telemetryWal;
 
     public TelemetryJob(CairoEngine engine) throws SqlException {
-        this(engine, null);
-    }
+        try {
+            telemetry = engine.getTelemetry();
+            telemetryWal = engine.getTelemetryWal();
+            telemetryConfigLogger = new TelemetryConfigLogger(engine);
 
-    public TelemetryJob(CairoEngine engine, @Nullable FunctionFactoryCache functionFactoryCache) throws SqlException {
-        telemetry = engine.getTelemetry();
-        telemetryWal = engine.getTelemetryWal();
-        telemetryConfigLogger = new TelemetryConfigLogger(engine);
+            try (final SqlCompiler compiler = engine.getSqlCompiler()) {
+                final SqlExecutionContextImpl sqlExecutionContext = new SqlExecutionContextImpl(engine, 1);
+                sqlExecutionContext.with(
+                        engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
+                        null,
+                        null
+                );
 
-        try (final SqlCompiler compiler = new SqlCompiler(engine, functionFactoryCache, null)) {
-            final SqlExecutionContextImpl sqlExecutionContext = new SqlExecutionContextImpl(engine, 1);
-            sqlExecutionContext.with(AllowAllCairoSecurityContext.INSTANCE, null, null);
-
-            telemetry.init(engine, compiler, sqlExecutionContext);
-            telemetryWal.init(engine, compiler, sqlExecutionContext);
-            telemetryConfigLogger.init(engine, compiler, sqlExecutionContext);
+                telemetry.init(engine, compiler, sqlExecutionContext);
+                telemetryWal.init(engine, compiler, sqlExecutionContext);
+                telemetryConfigLogger.init(engine, compiler, sqlExecutionContext);
+            }
+        } catch (Throwable th) {
+            close();
+            throw th;
         }
     }
 
     @Override
     public void close() {
-        telemetry.close();
-        telemetryWal.close();
-        telemetryConfigLogger.close();
+        Misc.free(telemetry);
+        Misc.free(telemetryWal);
+        Misc.free(telemetryConfigLogger);
     }
 
     @Override
