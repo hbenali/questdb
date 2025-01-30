@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,23 @@ package io.questdb.cairo.sql;
 
 import org.jetbrains.annotations.Nullable;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 public interface SqlExecutionCircuitBreaker extends ExecutionCircuitBreaker {
 
+    int STATE_OK = 0;
     SqlExecutionCircuitBreaker NOOP_CIRCUIT_BREAKER = new SqlExecutionCircuitBreaker() {
+        @Override
+        public void cancel() {
+        }
+
         @Override
         public boolean checkIfTripped() {
             return false;
         }
 
         @Override
-        public boolean checkIfTripped(long millis, int fd) {
+        public boolean checkIfTripped(long millis, long fd) {
             return false;
         }
 
@@ -45,8 +52,32 @@ public interface SqlExecutionCircuitBreaker extends ExecutionCircuitBreaker {
         }
 
         @Override
-        public int getFd() {
-            return -1;
+        public long getFd() {
+            return -1L;
+        }
+
+        @Override
+        public int getState() {
+            return STATE_OK;
+        }
+
+        @Override
+        public int getState(long millis, long fd) {
+            return STATE_OK;
+        }
+
+        @Override
+        public long getTimeout() {
+            return -1L;
+        }
+
+        @Override
+        public void init(SqlExecutionCircuitBreaker circuitBreaker) {
+        }
+
+        @Override
+        public boolean isThreadsafe() {
+            return true;
         }
 
         @Override
@@ -59,7 +90,11 @@ public interface SqlExecutionCircuitBreaker extends ExecutionCircuitBreaker {
         }
 
         @Override
-        public void setFd(int fd) {
+        public void setCancelledFlag(AtomicBoolean cancelledFlag) {
+        }
+
+        @Override
+        public void setFd(long fd) {
         }
 
         @Override
@@ -74,17 +109,55 @@ public interface SqlExecutionCircuitBreaker extends ExecutionCircuitBreaker {
         public void unsetTimer() {
         }
     };
-
+    int STATE_TIMEOUT = STATE_OK + 1; // 1
+    int STATE_BROKEN_CONNECTION = STATE_TIMEOUT + 1; // 2
+    int STATE_CANCELLED = STATE_BROKEN_CONNECTION + 1;// 3
     // Triggers timeout on first timeout check regardless of how much time elapsed since timer was reset
     // (used mainly for testing)
     long TIMEOUT_FAIL_ON_FIRST_CHECK = Long.MIN_VALUE;
 
-    boolean checkIfTripped(long millis, int fd);
+    /**
+     * Trigger this circuit breaker to fail on next check.
+     */
+    void cancel();
+
+    boolean checkIfTripped(long millis, long fd);
 
     @Nullable
     SqlExecutionCircuitBreakerConfiguration getConfiguration();
 
-    int getFd();
+    long getFd();
+
+    /**
+     * Similar to checkIfTripped() method but returns int value describing reason for tripping.
+     *
+     * @return circuit breaker state, one of: <br>
+     * - {@link #STATE_OK} <br>
+     * - {@link #STATE_CANCELLED} <br>
+     * - {@link #STATE_BROKEN_CONNECTION} <br>
+     * - {@link #STATE_TIMEOUT} <br>
+     */
+    int getState();
+
+    /**
+     * Similar to checkIfTripped(long millis, long fd) method but returns int value describing reason for tripping.
+     *
+     * @return circuit breaker state, one of: <br>
+     * - {@link #STATE_OK} <br>
+     * - {@link #STATE_CANCELLED} <br>
+     * - {@link #STATE_BROKEN_CONNECTION} <br>
+     * - {@link #STATE_TIMEOUT} <br>
+     */
+    int getState(long millis, long fd);
+
+    long getTimeout();
+
+    /**
+     * Initializes this circuit breaker from the one passed as a parameter by copying its state
+     */
+    void init(SqlExecutionCircuitBreaker circuitBreaker);
+
+    boolean isThreadsafe();
 
     /**
      * Checks if timer is due.
@@ -95,7 +168,9 @@ public interface SqlExecutionCircuitBreaker extends ExecutionCircuitBreaker {
 
     void resetTimer();
 
-    void setFd(int fd);
+    void setCancelledFlag(AtomicBoolean cancelled);
+
+    void setFd(long fd);
 
     /**
      * Uses internal state of the circuit breaker to assert conditions. This method also

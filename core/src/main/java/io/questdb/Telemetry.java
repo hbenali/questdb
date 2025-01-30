@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,13 @@
 
 package io.questdb;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.security.AllowAllCairoSecurityContext;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.sql.TableMetadata;
+import io.questdb.griffin.QueryBuilder;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -35,9 +40,14 @@ import io.questdb.mp.MPSequence;
 import io.questdb.mp.QueueConsumer;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SCSequence;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacade;
 import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
 import io.questdb.std.ObjectFactory;
+import io.questdb.std.Os;
 import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.str.Path;
 import io.questdb.tasks.AbstractTelemetryTask;
 import org.jetbrains.annotations.NotNull;
 
@@ -61,7 +71,7 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
         final TelemetryConfiguration telemetryConfiguration = type.getTelemetryConfiguration(configuration);
         enabled = telemetryConfiguration.getEnabled();
         if (enabled) {
-            this.telemetryType = type;
+            telemetryType = type;
             clock = configuration.getMicrosecondClock();
             telemetryQueue = new RingQueue<>(type.getTaskFactory(), telemetryConfiguration.getQueueCapacity());
             telemetryPubSeq = new MPSequence(telemetryQueue.getCycle());
@@ -72,15 +82,15 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
 
     @Override
     public void close() {
-        if (writer == null) {
-            return;
+        try {
+            if (writer != null) {
+                consumeAll();
+                telemetryType.logStatus(writer, TelemetrySystemEvent.SYSTEM_DOWN, clock.getTicks());
+                writer = Misc.free(writer);
+            }
+        } finally {
+            telemetryQueue = Misc.free(telemetryQueue);
         }
-
-        consumeAll();
-        Misc.free(telemetryQueue);
-
-        telemetryType.logStatus(writer, TelemetrySystemEvent.SYSTEM_DOWN, clock.getTicks());
-        writer = Misc.free(writer);
     }
 
     public void consume(T task) {
@@ -98,10 +108,28 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
             return;
         }
         String tableName = telemetryType.getTableName();
-        compiler.compile(telemetryType.getCreateSql(), sqlExecutionContext);
-        final TableToken tableToken = engine.getTableToken(tableName);
+        boolean shouldDropTable = false;
         try {
-            writer = engine.getWriter(AllowAllCairoSecurityContext.INSTANCE, tableToken, "telemetry");
+            TableToken tableToken = engine.verifyTableName(tableName);
+            try (TableMetadata meta = engine.getTableMetadata(tableToken)) {
+                shouldDropTable = (meta.getTtlHoursOrMonths() == 0);
+            }
+        } catch (CairoException e) {
+            if (!Chars.contains(e.getFlyweightMessage(), "table does not exist")) {
+                throw e;
+            }
+        }
+        if (shouldDropTable) {
+            compiler.query().$("DROP TABLE '").$(tableName).$("'")
+                    .compile(sqlExecutionContext)
+                    .getOperation()
+                    .execute(sqlExecutionContext, null)
+                    .await();
+        }
+        telemetryType.getCreateSql(compiler.query()).createTable(sqlExecutionContext);
+        TableToken tableToken = engine.verifyTableName(tableName);
+        try {
+            writer = engine.getWriter(tableToken, "telemetry");
         } catch (CairoException ex) {
             LOG.error()
                     .$("could not open [table=`").utf8(tableToken.getTableName())
@@ -111,6 +139,14 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
         }
 
         telemetryType.logStatus(writer, TelemetrySystemEvent.SYSTEM_UP, clock.getTicks());
+
+        if (telemetryType.shouldLogClasses()) {
+            telemetryType.logStatus(writer, getOSClass(), clock.getTicks());
+            telemetryType.logStatus(writer, getEnvTypeClass(), clock.getTicks());
+            telemetryType.logStatus(writer, getCpuClass(), clock.getTicks());
+            telemetryType.logStatus(writer, getDBSizeClass(engine.getConfiguration()), clock.getTicks());
+            telemetryType.logStatus(writer, getTableCountClass(engine), clock.getTicks());
+        }
     }
 
     public boolean isEnabled() {
@@ -127,15 +163,96 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
             return null;
         }
 
-        return telemetryQueue.get(cursor);
+        var task = telemetryQueue.get(cursor);
+        task.setQueueCursor(cursor);
+        return task;
     }
 
-    public void store() {
-        telemetryPubSeq.done(telemetryPubSeq.current());
+    public void store(T task) {
+        telemetryPubSeq.done(task.getQueueCursor());
+    }
+
+    private static short getCpuClass() {
+        final int cpus = Runtime.getRuntime().availableProcessors();
+        if (cpus <= 4) {         // 0 - 1-4 cores
+            return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE;
+        } else if (cpus <= 8) {  // 1 - 5-8 cores
+            return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE - 1;
+        } else if (cpus <= 16) { // 2 - 9-16 cores
+            return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE - 2;
+        } else if (cpus <= 32) { // 3 - 17-32 cores
+            return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE - 3;
+        } else if (cpus <= 64) { // 4 - 33-64 cores
+            return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE - 4;
+        }
+        // 5 - 65+ cores
+        return TelemetrySystemEvent.SYSTEM_CPU_CLASS_BASE - 5;
+    }
+
+    private static short getDBSizeClass(CairoConfiguration configuration) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        final CharSequence root = configuration.getRoot();
+        final Path path = Path.PATH.get();
+        path.of(root).$();
+
+        final long dbSize = ff.getDirSize(path);
+        if (dbSize <= 10 * Numbers.SIZE_1GB) {          // 0 - <10GB
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE;
+        } else if (dbSize <= 50 * Numbers.SIZE_1GB) {   // 1 - (10GB,50GB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 1;
+        } else if (dbSize <= 100 * Numbers.SIZE_1GB) {  // 2 - (50GB,100GB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 2;
+        } else if (dbSize <= 500 * Numbers.SIZE_1GB) {  // 3 - (100GB,500GB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 3;
+        } else if (dbSize <= Numbers.SIZE_1TB) {        // 4 - (500GB,1TB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 4;
+        } else if (dbSize <= 5 * Numbers.SIZE_1TB) {    // 5 - (1TB,5TB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 5;
+        } else if (dbSize <= 10 * Numbers.SIZE_1TB) {   // 6 - (5TB,10TB]
+            return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 6;
+        }
+        // 7 - >10TB
+        return TelemetrySystemEvent.SYSTEM_DB_SIZE_CLASS_BASE - 7;
+    }
+
+    private static short getEnvTypeClass() {
+        final int type = Os.getEnvironmentType();
+        return (short) (TelemetrySystemEvent.SYSTEM_ENV_TYPE_BASE - type);
+    }
+
+    private static short getOSClass() {
+        if (Os.isLinux()) {          // 0 - Linux
+            return TelemetrySystemEvent.SYSTEM_OS_CLASS_BASE;
+        } else if (Os.isOSX()) {     // 1 - OS X
+            return TelemetrySystemEvent.SYSTEM_OS_CLASS_BASE - 1;
+        } else if (Os.isWindows()) { // 2 - Windows
+            return TelemetrySystemEvent.SYSTEM_OS_CLASS_BASE - 2;
+        }
+        // 3 - BSD
+        return TelemetrySystemEvent.SYSTEM_OS_CLASS_BASE - 3;
+    }
+
+    private static short getTableCountClass(CairoEngine engine) {
+        final long tableCount = engine.getTableTokenCount(false);
+        if (tableCount <= 10) {          // 0 - 0-10 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE;
+        } else if (tableCount <= 25) {   // 1 - 11-25 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 1;
+        } else if (tableCount <= 50) {   // 2 - 26-50 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 2;
+        } else if (tableCount <= 100) {  // 3 - 51-100 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 3;
+        } else if (tableCount <= 250) {  // 4 - 101-250 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 4;
+        } else if (tableCount <= 1000) { // 5 - 251-1000 tables
+            return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 5;
+        }
+        // 6 - 1001+ tables
+        return TelemetrySystemEvent.SYSTEM_TABLE_COUNT_CLASS_BASE - 6;
     }
 
     public interface TelemetryType<T extends AbstractTelemetryTask> {
-        String getCreateSql();
+        QueryBuilder getCreateSql(QueryBuilder builder);
 
         String getTableName();
 
@@ -148,6 +265,10 @@ public final class Telemetry<T extends AbstractTelemetryTask> implements Closeab
         }
 
         default void logStatus(TableWriter writer, short systemStatus, long micros) {
+        }
+
+        default boolean shouldLogClasses() {
+            return false;
         }
     }
 
