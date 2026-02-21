@@ -947,6 +947,21 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getSqlIntervalIncrementalMergeThreshold() {
+        return getDelegate().getSqlIntervalIncrementalMergeThreshold();
+    }
+
+    @Override
+    public int getSqlIntervalMaxBracketDepth() {
+        return getDelegate().getSqlIntervalMaxBracketDepth();
+    }
+
+    @Override
+    public int getSqlIntervalMaxIntervalsAfterMerge() {
+        return getDelegate().getSqlIntervalMaxIntervalsAfterMerge();
+    }
+
+    @Override
     public int getSqlJitBindVarsMemoryMaxPages() {
         return getDelegate().getSqlJitBindVarsMemoryMaxPages();
     }
@@ -1087,6 +1102,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getSqlSortKeyMaterializationThreshold() {
+        return getDelegate().getSqlSortKeyMaterializationThreshold();
+    }
+
+    @Override
     public int getSqlSortKeyMaxPages() {
         return getDelegate().getSqlSortKeyMaxPages();
     }
@@ -1159,21 +1179,6 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     @Override
     public int getSqlWindowTreeKeyPageSize() {
         return getDelegate().getSqlWindowTreeKeyPageSize();
-    }
-
-    @Override
-    public int getSqlIntervalIncrementalMergeThreshold() {
-        return getDelegate().getSqlIntervalIncrementalMergeThreshold();
-    }
-
-    @Override
-    public int getSqlIntervalMaxBracketDepth() {
-        return getDelegate().getSqlIntervalMaxBracketDepth();
-    }
-
-    @Override
-    public int getSqlIntervalMaxIntervalsAfterMerge() {
-        return getDelegate().getSqlIntervalMaxIntervalsAfterMerge();
     }
 
     @Override
